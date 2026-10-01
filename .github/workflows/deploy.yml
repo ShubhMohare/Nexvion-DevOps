@@ -5,59 +5,126 @@ on:
     branches:
       - main
 
-env:
-  AWS_REGION: ap-south-1
-  ECR_REPOSITORY: nexvion
-  ECS_SERVICE: nexvion-service
-  ECS_CLUSTER: nexvion-cluster
-  ECS_TASK_DEFINITION: task-definition.json
-  CONTAINER_NAME: nexvion
-
 permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: nexvion
+  ECS_CLUSTER: nexvion-cluster
+  ECS_SERVICE: nexvion-service
+  ECS_TASK_DEFINITION: task-definition.json
+
 jobs:
   deploy:
+    name: Build and Deploy Nexvion
     runs-on: ubuntu-latest
 
     steps:
+
+      # 1. Checkout source code
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 2. Configure AWS using GitHub OIDC
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # 3. Login to Amazon ECR
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # 4. Set Docker image
+      - name: Set image
+        id: image
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          IMAGE_URI=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}
+
+          echo "IMAGE_URI=${IMAGE_URI}" >> $GITHUB_ENV
+
+          echo "Docker image:"
+          echo "${IMAGE_URI}"
+
+      # 5. Build Docker image
       - name: Build Docker image
         run: |
-          docker build -t ${{ env.ECR_REPOSITORY }}:${{ github.sha }} .
-          docker tag ${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker build -t "$IMAGE_URI" .
 
+      # 6. Push Docker image to ECR
       - name: Push Docker image
         run: |
-          docker push \
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker push "$IMAGE_URI"
 
-      - name: Render ECS task definition
-        id: task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: ${{ env.ECS_TASK_DEFINITION }}
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+      # 7. Download current ECS task definition
+      - name: Download ECS task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_DEFINITION" \
+            --query taskDefinition \
+            --output json > task-definition-current.json
 
+      # 8. Remove AWS-generated fields
+      - name: Clean task definition
+        run: |
+          jq 'del(
+            .taskDefinitionArn,
+            .revision,
+            .status,
+            .requiresAttributes,
+            .compatibilities,
+            .registeredAt,
+            .registeredBy
+          )' task-definition-current.json > task-definition-clean.json
+
+      # 9. Update image in task definition
+      - name: Update container image
+        run: |
+          jq --arg IMAGE "$IMAGE_URI" \
+            '.containerDefinitions[0].image = $IMAGE' \
+            task-definition-clean.json > task-definition-new.json
+
+      # 10. Register new ECS task definition
+      - name: Register ECS task definition
+        id: register
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition-new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+
+          echo "New task definition:"
+          echo "$TASK_DEF_ARN"
+
+      # 11. Deploy new task definition to ECS
       - name: Deploy to ECS
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
-        with:
-          task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$TASK_DEF_ARN" \
+            --force-new-deployment
+
+      # 12. Wait for deployment
+      - name: Wait for ECS deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
+
+      # 13. Deployment successful
+      - name: Deployment completed
+        run: |
+          echo "================================="
+          echo "Nexvion deployment successful!"
+          echo "================================="
+          echo "Cluster: $ECS_CLUSTER"
+          echo "Service: $ECS_SERVICE"
+          echo "Image: $IMAGE_URI"
