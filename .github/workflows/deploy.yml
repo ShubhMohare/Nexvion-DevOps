@@ -14,7 +14,6 @@ env:
   ECR_REPOSITORY: nexvion
   ECS_CLUSTER: nexvion-cluster
   ECS_SERVICE: nexvion-service
-  ECS_TASK_DEFINITION: task-definition.json
 
 jobs:
   deploy:
@@ -23,53 +22,50 @@ jobs:
 
     steps:
 
-      # 1. Checkout source code
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. Configure AWS using GitHub OIDC
+      # Debug GitHub OIDC claims
+      - name: Debug OIDC token
+        uses: github/actions-oidc-debugger@main
+
+      # Configure AWS
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 3. Login to Amazon ECR
+      # Login to ECR
       - name: Login to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # 4. Set Docker image
-      - name: Set image
-        id: image
+      # Create image name
+      - name: Set image URI
         run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          IMAGE_URI=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}
+          IMAGE_URI=754840114934.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+          echo "Image: $IMAGE_URI"
 
-          echo "IMAGE_URI=${IMAGE_URI}" >> $GITHUB_ENV
-
-          echo "Docker image:"
-          echo "${IMAGE_URI}"
-
-      # 5. Build Docker image
+      # Build image
       - name: Build Docker image
         run: |
           docker build -t "$IMAGE_URI" .
 
-      # 6. Push Docker image to ECR
+      # Push image
       - name: Push Docker image
         run: |
           docker push "$IMAGE_URI"
 
-      # 7. Download current ECS task definition
+      # Download current ECS task definition
       - name: Download ECS task definition
         run: |
           aws ecs describe-task-definition \
-            --task-definition "$ECS_TASK_DEFINITION" \
+            --task-definition nexvion-task \
             --query taskDefinition \
             --output json > task-definition-current.json
 
-      # 8. Remove AWS-generated fields
+      # Clean AWS-generated fields
       - name: Clean task definition
         run: |
           jq 'del(
@@ -82,16 +78,15 @@ jobs:
             .registeredBy
           )' task-definition-current.json > task-definition-clean.json
 
-      # 9. Update image in task definition
+      # Update container image
       - name: Update container image
         run: |
           jq --arg IMAGE "$IMAGE_URI" \
             '.containerDefinitions[0].image = $IMAGE' \
             task-definition-clean.json > task-definition-new.json
 
-      # 10. Register new ECS task definition
+      # Register new task definition
       - name: Register ECS task definition
-        id: register
         run: |
           TASK_DEF_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://task-definition-new.json \
@@ -100,10 +95,7 @@ jobs:
 
           echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
 
-          echo "New task definition:"
-          echo "$TASK_DEF_ARN"
-
-      # 11. Deploy new task definition to ECS
+      # Deploy to ECS
       - name: Deploy to ECS
         run: |
           aws ecs update-service \
@@ -112,19 +104,13 @@ jobs:
             --task-definition "$TASK_DEF_ARN" \
             --force-new-deployment
 
-      # 12. Wait for deployment
+      # Wait for ECS
       - name: Wait for ECS deployment
         run: |
           aws ecs wait services-stable \
             --cluster "$ECS_CLUSTER" \
             --services "$ECS_SERVICE"
 
-      # 13. Deployment successful
       - name: Deployment completed
         run: |
-          echo "================================="
           echo "Nexvion deployment successful!"
-          echo "================================="
-          echo "Cluster: $ECS_CLUSTER"
-          echo "Service: $ECS_SERVICE"
-          echo "Image: $IMAGE_URI"
