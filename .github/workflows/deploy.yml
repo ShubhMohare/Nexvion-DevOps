@@ -14,8 +14,47 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Get GitHub OIDC claims
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+        run: |
+          echo "Requesting GitHub OIDC token..."
 
-      - name: Debug GitHub OIDC claims
-        uses: github/actions-oidc-debugger@main
+          RESPONSE=$(curl -s \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com")
+
+          TOKEN=$(echo "$RESPONSE" | jq -r '.value')
+
+          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
+            echo "Failed to get OIDC token"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          PAYLOAD=$(echo "$TOKEN" | cut -d '.' -f 2)
+
+          PAYLOAD=$(python3 -c "
+          import sys, base64
+          data=sys.stdin.read().strip()
+          data += '=' * (-len(data) % 4)
+          print(base64.urlsafe_b64decode(data).decode())
+          " <<< "$PAYLOAD")
+
+          echo "======================================"
+          echo "OIDC CLAIMS"
+          echo "======================================"
+
+          echo "$PAYLOAD" | jq '{
+            sub: .sub,
+            aud: .aud,
+            repository: .repository,
+            repository_id: .repository_id,
+            repository_owner: .repository_owner,
+            repository_owner_id: .repository_owner_id,
+            ref: .ref,
+            ref_type: .ref_type
+          }'
+
+          echo "======================================"
