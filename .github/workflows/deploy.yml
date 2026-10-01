@@ -1,4 +1,4 @@
-name: Deploy Nexvion to AWS ECS
+name: Debug Nexvion OIDC
 
 on:
   push:
@@ -9,108 +9,13 @@ permissions:
   id-token: write
   contents: read
 
-env:
-  AWS_REGION: ap-south-1
-  ECR_REPOSITORY: nexvion
-  ECS_CLUSTER: nexvion-cluster
-  ECS_SERVICE: nexvion-service
-
 jobs:
-  deploy:
-    name: Build and Deploy Nexvion
+  debug:
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Debug GitHub OIDC claims
-      - name: Debug OIDC token
+      - name: Debug GitHub OIDC claims
         uses: github/actions-oidc-debugger@main
-
-      # Configure AWS
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      # Login to ECR
-      - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
-
-      # Create image name
-      - name: Set image URI
-        run: |
-          IMAGE_URI=754840114934.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}
-          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
-          echo "Image: $IMAGE_URI"
-
-      # Build image
-      - name: Build Docker image
-        run: |
-          docker build -t "$IMAGE_URI" .
-
-      # Push image
-      - name: Push Docker image
-        run: |
-          docker push "$IMAGE_URI"
-
-      # Download current ECS task definition
-      - name: Download ECS task definition
-        run: |
-          aws ecs describe-task-definition \
-            --task-definition nexvion-task \
-            --query taskDefinition \
-            --output json > task-definition-current.json
-
-      # Clean AWS-generated fields
-      - name: Clean task definition
-        run: |
-          jq 'del(
-            .taskDefinitionArn,
-            .revision,
-            .status,
-            .requiresAttributes,
-            .compatibilities,
-            .registeredAt,
-            .registeredBy
-          )' task-definition-current.json > task-definition-clean.json
-
-      # Update container image
-      - name: Update container image
-        run: |
-          jq --arg IMAGE "$IMAGE_URI" \
-            '.containerDefinitions[0].image = $IMAGE' \
-            task-definition-clean.json > task-definition-new.json
-
-      # Register new task definition
-      - name: Register ECS task definition
-        run: |
-          TASK_DEF_ARN=$(aws ecs register-task-definition \
-            --cli-input-json file://task-definition-new.json \
-            --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
-
-          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
-
-      # Deploy to ECS
-      - name: Deploy to ECS
-        run: |
-          aws ecs update-service \
-            --cluster "$ECS_CLUSTER" \
-            --service "$ECS_SERVICE" \
-            --task-definition "$TASK_DEF_ARN" \
-            --force-new-deployment
-
-      # Wait for ECS
-      - name: Wait for ECS deployment
-        run: |
-          aws ecs wait services-stable \
-            --cluster "$ECS_CLUSTER" \
-            --services "$ECS_SERVICE"
-
-      - name: Deployment completed
-        run: |
-          echo "Nexvion deployment successful!"
