@@ -1,4 +1,4 @@
-name: Debug Nexvion OIDC
+name: Deploy Nexvion to AWS ECS
 
 on:
   push:
@@ -9,52 +9,98 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: nexvion
+  ECS_CLUSTER: nexvion-cluster
+  ECS_SERVICE: nexvion-service
+  ECS_TASK_DEFINITION: nexvion-task
+
 jobs:
-  debug:
+  deploy:
+    name: Build and Deploy Nexvion
     runs-on: ubuntu-latest
 
     steps:
-      - name: Get GitHub OIDC claims
-        env:
-          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
-          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image URI
         run: |
-          echo "Requesting GitHub OIDC token..."
+          IMAGE_URI=754840114934.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
-          RESPONSE=$(curl -s \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com")
+      - name: Build Docker image
+        run: |
+          docker build -t "$IMAGE_URI" .
 
-          TOKEN=$(echo "$RESPONSE" | jq -r '.value')
+      - name: Push Docker image
+        run: |
+          docker push "$IMAGE_URI"
 
-          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
-            echo "Failed to get OIDC token"
-            echo "$RESPONSE"
-            exit 1
-          fi
+      - name: Download ECS task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_DEFINITION" \
+            --query taskDefinition \
+            --output json > task-definition.json
 
-          PAYLOAD=$(echo "$TOKEN" | cut -d '.' -f 2)
+      - name: Clean task definition
+        run: |
+          jq 'del(
+            .taskDefinitionArn,
+            .revision,
+            .status,
+            .requiresAttributes,
+            .compatibilities,
+            .registeredAt,
+            .registeredBy
+          )' task-definition.json > task-definition-clean.json
 
-          PAYLOAD=$(python3 -c "
-          import sys, base64
-          data=sys.stdin.read().strip()
-          data += '=' * (-len(data) % 4)
-          print(base64.urlsafe_b64decode(data).decode())
-          " <<< "$PAYLOAD")
+      - name: Update container image
+        run: |
+          jq --arg IMAGE "$IMAGE_URI" \
+            '.containerDefinitions[0].image = $IMAGE' \
+            task-definition-clean.json > task-definition-new.json
 
+      - name: Register new task definition
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition-new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$TASK_DEF_ARN" \
+            --force-new-deployment
+
+      - name: Wait for ECS deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
+
+      - name: Deployment successful
+        run: |
           echo "======================================"
-          echo "OIDC CLAIMS"
+          echo "NEXVION DEPLOYMENT SUCCESSFUL"
           echo "======================================"
-
-          echo "$PAYLOAD" | jq '{
-            sub: .sub,
-            aud: .aud,
-            repository: .repository,
-            repository_id: .repository_id,
-            repository_owner: .repository_owner,
-            repository_owner_id: .repository_owner_id,
-            ref: .ref,
-            ref_type: .ref_type
-          }'
-
-          echo "======================================"
+          echo "ECS Cluster: $ECS_CLUSTER"
+          echo "ECS Service: $ECS_SERVICE"
+          echo "Image: $IMAGE_URI"
